@@ -26,9 +26,11 @@ class ChangeOrderService(BaseModuleService):
                 return False, "变更单不存在"
         return True, ""
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def run_action(
+        self, entry_id: int, action: str, receipt_no: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
         if action == "签发变更":
-            result = exhibition.propagate_change_order(entry_id)
+            result = exhibition.propagate_change_order(entry_id, receipt_no=receipt_no)
             if not result["ok"]:
                 return None, result["reason"]
             entry = store.find(self.MODULE, entry_id)

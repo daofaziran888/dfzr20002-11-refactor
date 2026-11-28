@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import copy
+import threading
+import time
 from collections import deque
 from typing import Any
 
@@ -360,64 +362,363 @@ def do_handover(handover_id: int) -> dict[str, Any]:
     return {"ok": True, "reason": "交场完成", "handover": handover, "validation": validation}
 
 
-# ---------- 变更传播与回退 ----------
+# ---------- 变更签发受理与回退 ----------
 
-def propagate_change_order(change_id: int) -> dict[str, Any]:
-    """签发变更指令后，受影响展位的进度节点回到'待确认'并需要重新验收。"""
-    change = store.find("change_order", change_id)
-    if change is None:
-        return {"ok": False, "reason": f"变更单 {change_id} 不存在"}
+# 工作台（/api/change_order/{id}/actions）和集成入口（/api/exhibition/change/{id}/issue）
+# 共用同一把签发锁和同一份受理回执，避免两处同时回退同一个完工节点。
+_CHANGE_ISSUE_LOCK = threading.RLock()
 
-    booth_no_list = str(change.get("影响展位", "")).split(",")
-    booth_no_list = [b.strip() for b in booth_no_list if b.strip()]
-    affected_nodes: list[dict[str, Any]] = []
-    affected_checklists: list[dict[str, Any]] = []
 
-    for booth_no in booth_no_list:
-        # 回退进度节点
-        construction_nodes = store.rows("construction")
-        for node in construction_nodes:
-            node_booth = str(node.get("备注说明", ""))
-            if booth_no in node_booth and node.get("status") == "已确认":
-                node["status"] = "待确认"
-                node["pending"] = True
-                node["abnormal"] = True
-                affected_nodes.append({"id": node.get("id"), "name": node.get("节点名称", "")})
+def _change_booths(change: dict[str, Any]) -> list[str]:
+    booths = [b.strip() for b in str(change.get("影响展位", "")).split(",")]
+    return [b for b in booths if b]
 
-        # 标记验收项需重新验收
-        checklist_items = store.rows("checklist")
-        for item in checklist_items:
-            if str(item.get("负责班组", "")) == booth_no and item.get("status") == "已确认":
-                item["status"] = "待确认"
-                item["pending"] = True
-                item["abnormal"] = True
-                affected_checklists.append({"id": item.get("id"), "item": item.get("验收条目", "")})
 
-    before_state = copy.deepcopy(change)
-    change["status"] = "已确认"
-    change["pending"] = False
+def change_receipt_no(change: dict[str, Any]) -> str:
+    """受理编号：优先使用变更单登记编号，缺省时按变更单 id 生成。"""
+    registered = str(change.get("登记编号", "")).strip()
+    if registered:
+        return registered
+    return f"CHAN-{int(change.get('id', 0)):04d}"
 
-    store.event_log.record(
-        module="change_order",
-        entry_id=change_id,
-        action="签发变更-传播回退",
-        before=before_state,
-        after=copy.deepcopy(change),
-        extra={
-            "affected_booths": booth_no_list,
-            "reverted_nodes": len(affected_nodes),
-            "reverted_checklists": len(affected_checklists),
-        },
+
+def _change_fingerprint(change: dict[str, Any]) -> str:
+    return "|".join(
+        str(change.get(field, "")).strip()
+        for field in ("变更内容", "影响展位", "施工班组")
     )
-    store.rebuild_indices()
 
+
+def _target_matches(module: str, row: dict[str, Any], booths: list[str]) -> bool:
+    if module == "construction":
+        node_booth = str(row.get("备注说明", ""))
+        return any(booth in node_booth for booth in booths)
+    return str(row.get("负责班组", "")) in booths
+
+
+def _target_label(module: str, row: dict[str, Any]) -> str:
+    if module == "construction":
+        return str(row.get("节点名称", ""))
+    return str(row.get("验收条目", ""))
+
+
+def _target_detail(module: str, row_id: int, label: str) -> dict[str, Any]:
+    """保持既有输出口径：进度节点用 name，验收项用 item。"""
+    return {"id": row_id, "name" if module == "construction" else "item": label}
+
+
+def _capture_change_targets(
+    module: str, booths: list[str],
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """首次受理时固定回退目标，后续补办/重发只处理这份目标清单。
+
+    这样签发之后才完工的施工行、才重签的验收项不会被旧单再次回退。
+    """
+    target_ids: list[int] = []
+    details: list[dict[str, Any]] = []
+    for row in store.rows(module):
+        if row.get("status") != "已确认":
+            continue
+        if not _target_matches(module, row, booths):
+            continue
+        row_id = int(row.get("id", 0))
+        if row_id in target_ids:
+            continue
+        target_ids.append(row_id)
+        details.append(_target_detail(module, row_id, _target_label(module, row)))
+    return target_ids, details
+
+
+def _reconfirmed_after(module: str, entry_id: int, since: float) -> bool:
+    """判断目标行在本次受理之后是否已被现场重新确认（重做/重签）。"""
+    for event in reversed(store.event_log.for_module(module, entry_id)):
+        if event.get("timestamp", 0) <= since:
+            break
+        after = event.get("after") or {}
+        if after.get("status") == "已确认":
+            return True
+    return False
+
+
+def _apply_change_targets(
+    module: str, receipt: dict[str, Any], since: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """按固定目标清单执行回退，只处理尚未办理过的目标。"""
+    id_key = f"target_{module}_ids"
+    processed_key = f"processed_{module}_ids"
+    reverted_key = f"reverted_{module}_ids"
+    detail_key = f"target_{module}"
+    redo_key = "respected_redo_nodes" if module == "construction" else "respected_redo_checklists"
+
+    details = {int(item["id"]): item for item in receipt.get(detail_key, [])}
+    processed: set[int] = set(receipt.get(processed_key, []))
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    for row_id in receipt.get(id_key, []):
+        row_id = int(row_id)
+        if row_id in processed:
+            continue
+
+        row = store.find(module, row_id)
+        detail = dict(details.get(row_id) or _target_detail(module, row_id, ""))
+
+        def mark_done() -> None:
+            processed.add(row_id)
+            receipt[processed_key] = sorted(processed)
+            store.save_change_receipt(receipt)
+
+        if row is None or row.get("status") != "已确认":
+            # 目标已不在完工态，视为已办理，不再重复回退。
+            mark_done()
+            continue
+
+        if _reconfirmed_after(module, row_id, since):
+            # 现场已在本次受理后重做/重签，保留新进展。
+            receipt.setdefault(redo_key, []).append(detail)
+            skipped.append(detail)
+            mark_done()
+            continue
+
+        row["status"] = "待确认"
+        row["pending"] = True
+        row["abnormal"] = True
+        receipt.setdefault(reverted_key, []).append(row_id)
+        applied.append(detail)
+        mark_done()
+
+    return applied, skipped
+
+
+def _snapshot_first_issuance(
+    receipt: dict[str, Any], attempt: dict[str, Any],
+) -> None:
+    """固定首办受理的影响明细，后续补办/重发不改写这份口径。"""
+    if receipt.get("first_issuance") is not None:
+        return
+    receipt["first_issuance"] = {
+        "receipt_no": receipt["receipt_no"],
+        "change_id": receipt["change_id"],
+        "issued_at": receipt.get("created_at"),
+        "complete": bool(attempt.get("complete")),
+        "affected_booths": list(receipt.get("affected_booths", [])),
+        "target_nodes": [
+            {"id": int(d["id"]), "name": str(d.get("name", ""))}
+            for d in receipt.get("target_construction", [])
+        ],
+        "target_checklists": [
+            {"id": int(d["id"]), "item": str(d.get("item", ""))}
+            for d in receipt.get("target_checklist", [])
+        ],
+        "affected_nodes": list(attempt.get("applied_nodes", [])),
+        "affected_checklists": list(attempt.get("applied_checklists", [])),
+        "reverted_nodes": len(attempt.get("applied_nodes", [])),
+        "reverted_checklists": len(attempt.get("applied_checklists", [])),
+    }
+
+
+def propagate_change_order(
+    change_id: int, receipt_no: str | None = None,
+) -> dict[str, Any]:
+    """签发变更指令：受影响展位的进度节点与验收项回退为待确认。
+
+    工作台和集成入口共用本函数。签发结果按受理编号落一份回执：
+    - 正常签发保持原有回退口径和返回结构；
+    - 同一受理编号重复提交（补办/重发）只续办尚未办理的固定目标，
+      不会把已回退后又重做的节点、已重签的验收项再撤一次；
+    - 部分目标处理失败时如实返回不完整，回执保留已办理进度供原号补办。
+    """
+    with _CHANGE_ISSUE_LOCK:
+        change = store.find("change_order", change_id)
+        if change is None:
+            return {"ok": False, "reason": f"变更单 {change_id} 不存在"}
+
+        accepted_no = str(receipt_no or "").strip() or change_receipt_no(change)
+        existing = store.find_change_receipt(accepted_no)
+        if existing is not None and int(existing.get("change_id", 0)) != int(change_id):
+            return {
+                "ok": False,
+                "reason": f"受理编号 {accepted_no} 已用于变更单 {existing.get('change_id')}，不能重复受理",
+            }
+
+        canonical = existing
+        if canonical is None:
+            # 同一变更换了一个受理编号提交（另一入口补发原单），仍归并到首办回执，
+            # 不能当作全新受理再撤一遍已经重做的节点。
+            canonical = store.change_receipt_for_change(change_id)
+            if canonical is not None:
+                store.alias_change_receipt(accepted_no, canonical)
+
+        now = time.time()
+        if canonical is None:
+            receipt: dict[str, Any] = {
+                "receipt_no": accepted_no,
+                "change_id": change_id,
+                "fingerprint": _change_fingerprint(change),
+                "created_at": now,
+                "updated_at": now,
+                "status": "处理中",
+                "complete": False,
+                "attempts": [],
+                "affected_booths": _change_booths(change),
+                "target_construction_ids": None,
+                "target_checklist_ids": None,
+                "target_construction": [],
+                "target_checklist": [],
+                "processed_construction_ids": [],
+                "processed_checklist_ids": [],
+                "reverted_construction_ids": [],
+                "reverted_checklist_ids": [],
+                "respected_redo_nodes": [],
+                "respected_redo_checklists": [],
+                "retry_count": 0,
+                "failed_stage": "",
+                "last_error": "",
+                "first_issuance": None,
+            }
+            attempt_kind = "首次签发"
+            store.save_change_receipt(receipt)
+        else:
+            receipt = canonical
+            # 同一变更已签发过：只有首办不完整时才叫补办，否则是重发。
+            attempt_kind = "补办" if not receipt.get("complete") else "重发"
+            receipt["last_receipt_no"] = accepted_no
+            receipt["retry_count"] = int(receipt.get("retry_count", 0)) + 1
+            receipt["updated_at"] = now
+            receipt["fingerprint"] = _change_fingerprint(change)
+            store.save_change_receipt(receipt)
+
+        booth_list = list(receipt.get("affected_booths") or _change_booths(change))
+        receipt["affected_booths"] = booth_list
+        applied_nodes: list[dict[str, Any]] = []
+        applied_checklists: list[dict[str, Any]] = []
+        skipped_nodes: list[dict[str, Any]] = []
+        skipped_checklists: list[dict[str, Any]] = []
+        error = ""
+        failed_stage = ""
+
+        try:
+            # 首次受理即一次性固定整份影响目标（进度 + 验收）：
+            # 之后任一环节失败，补办都只续办未办理项，不会重新扩大影响面。
+            if (receipt.get("target_construction_ids") is None
+                    or receipt.get("target_checklist_ids") is None):
+                if receipt.get("target_construction_ids") is None:
+                    ids, details = _capture_change_targets("construction", booth_list)
+                    receipt["target_construction_ids"] = ids
+                    receipt["target_construction"] = details
+                if receipt.get("target_checklist_ids") is None:
+                    ids, details = _capture_change_targets("checklist", booth_list)
+                    receipt["target_checklist_ids"] = ids
+                    receipt["target_checklist"] = details
+                store.save_change_receipt(receipt)
+
+            failed_stage = "construction"
+            applied_nodes, skipped_nodes = _apply_change_targets(
+                "construction", receipt, receipt["created_at"])
+
+            failed_stage = "checklist"
+            applied_checklists, skipped_checklists = _apply_change_targets(
+                "checklist", receipt, receipt["created_at"])
+        except Exception as exc:  # 单项处理失败时保留已办理进度，支持原号补办
+            error = str(exc) or exc.__class__.__name__
+            receipt["failed_stage"] = failed_stage
+            receipt["last_error"] = error
+
+        complete = not error
+        receipt["complete"] = complete
+        receipt["status"] = "已签发" if complete else "处理中"
+        receipt["updated_at"] = time.time()
+        receipt["attempts"].append({
+            "at": receipt["updated_at"],
+            "kind": attempt_kind,
+            "complete": complete,
+            "failed_stage": failed_stage if error else "",
+            "error": error,
+            "applied_nodes": list(applied_nodes),
+            "applied_checklists": list(applied_checklists),
+            "respected_redo_nodes": list(skipped_nodes),
+            "respected_redo_checklists": list(skipped_checklists),
+        })
+        _snapshot_first_issuance(receipt, receipt["attempts"][-1])
+        store.save_change_receipt(receipt)
+
+        before_state = copy.deepcopy(change)
+        change["status"] = "已确认"
+        change["pending"] = False
+
+        if complete:
+            reason = (
+                f"变更已签发，{len(applied_nodes)} 个进度节点和 "
+                f"{len(applied_checklists)} 条验收项已回退"
+            )
+        else:
+            reason = f"变更已受理，{failed_stage} 回退未完成：{error}"
+
+        store.event_log.record(
+            module="change_order",
+            entry_id=change_id,
+            action="签发变更-传播回退",
+            before=before_state,
+            after=copy.deepcopy(change),
+            extra={
+                "affected_booths": booth_list,
+                "reverted_nodes": len(applied_nodes),
+                "reverted_checklists": len(applied_checklists),
+                "receipt_no": accepted_no,
+                "receipt_kind": attempt_kind,
+                "receipt_complete": complete,
+                "respected_redo_nodes": len(skipped_nodes),
+                "respected_redo_checklists": len(skipped_checklists),
+                "error": error,
+            },
+        )
+        store.rebuild_indices()
+
+        result = {
+            "ok": complete,
+            "reason": reason,
+            "affected_booths": booth_list,
+            "affected_nodes": applied_nodes,
+            "affected_checklists": applied_checklists,
+            "receipt_no": accepted_no,
+            "receipt_kind": attempt_kind,
+            "replayed": attempt_kind != "首次签发",
+            "receipt": copy.deepcopy(receipt),
+            "first_issuance": copy.deepcopy(receipt.get("first_issuance")),
+        }
+        if not complete:
+            result["failed_stage"] = failed_stage
+            result["error"] = error
+        return result
+
+
+def get_change_receipt(
+    receipt_no: str | None = None, change_id: int | None = None,
+) -> dict[str, Any]:
+    """按受理编号（或变更单 id）反查签发回执与首办影响明细。"""
+    receipt: dict[str, Any] | None = None
+    if receipt_no:
+        receipt = store.find_change_receipt(receipt_no)
+    elif change_id is not None:
+        receipt = store.change_receipt_for_change(int(change_id))
+    if receipt is None:
+        label = receipt_no or change_id
+        return {"ok": False, "reason": f"受理编号 {label} 没有签发回执"}
     return {
         "ok": True,
-        "reason": f"变更已签发，{len(affected_nodes)} 个进度节点和 {len(affected_checklists)} 条验收项已回退",
-        "affected_booths": booth_no_list,
-        "affected_nodes": affected_nodes,
-        "affected_checklists": affected_checklists,
+        "receipt_no": receipt["receipt_no"],
+        "queried_receipt_no": receipt_no or receipt["receipt_no"],
+        "aliases": store.change_receipt_aliases(receipt),
+        "receipt": copy.deepcopy(receipt),
+        "first_issuance": copy.deepcopy(receipt.get("first_issuance")),
     }
+
+
+def change_issuance_receipt(
+    receipt_no: str | None = None, change_id: int | None = None,
+) -> dict[str, Any]:
+    """`get_change_receipt` 的别名，供两处入口共用。"""
+    return get_change_receipt(receipt_no=receipt_no, change_id=change_id)
 
 
 # ---------- 展品运输排期冲突检测 ----------

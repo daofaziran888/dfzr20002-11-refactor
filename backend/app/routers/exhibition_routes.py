@@ -82,11 +82,23 @@ def confirm_handover(handover_id: int) -> dict:
 
 
 @exhibition_router.post("/change/{change_id}/issue")
-def issue_change_order(change_id: int) -> dict:
-    """签发变更指令：触发进度回退与重新验收传播。"""
-    result = exhibition.propagate_change_order(change_id)
-    if not result["ok"]:
+def issue_change_order(change_id: int, receipt_no: str | None = None) -> dict:
+    """签发变更指令：触发进度回退与重新验收传播。
+
+    传 receipt_no 时按该受理编号补办/重发原单；同一受理编号只回退一次。
+    """
+    result = exhibition.propagate_change_order(change_id, receipt_no=receipt_no)
+    if not result["ok"] and not result.get("receipt"):
         raise HTTPException(status_code=400, detail=result["reason"])
+    return result
+
+
+@exhibition_router.get("/change/{change_id}/receipt")
+def change_receipt(change_id: int, receipt_no: str | None = None) -> dict:
+    """反查变更签发回执与首办影响明细（受理编号或变更单 id）。"""
+    result = exhibition.get_change_receipt(receipt_no=receipt_no, change_id=change_id)
+    if not result["ok"]:
+        raise HTTPException(status_code=404, detail=result["reason"])
     return result
 
 

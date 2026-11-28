@@ -87,7 +87,10 @@ class BaseModuleService:
         """子类覆写：返回 (是否允许, 拒绝原因)。"""
         return True, ""
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def run_action(
+        self, entry_id: int, action: str, receipt_no: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """执行状态动作；receipt_no 供需要受理编号的模块（如签发变更）使用。"""
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, f"{self.ENTITY} {entry_id} 不存在或已归档"

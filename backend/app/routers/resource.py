@@ -94,5 +94,7 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
+    # remark 在需要受理编号的动作里作为受理编号（兼容原动作接口）。
+    entry, message = service.run_action(
+        entry_id, payload.action.strip(), receipt_no=payload.remark)
     return ActionResult(ok=entry is not None, message=message, entry=entry)

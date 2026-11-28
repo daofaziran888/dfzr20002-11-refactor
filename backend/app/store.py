@@ -82,6 +82,8 @@ class MemoryStore:
             else:
                 self._id_counters[name] = 0
         self.event_log = EventLog()
+        # 变更签发受理回执：受理编号 → 回执（工作台与集成入口共用）
+        self._change_receipts: dict[str, dict[str, Any]] = {}
         # 索引：展位编号 → 展位记录
         self._booth_index: dict[str, dict[str, Any]] = {}
         for row in self._tables.get("booth", []):
@@ -148,6 +150,45 @@ class MemoryStore:
             {"label": "异常量", "value": sum(int(item["abnormal"]) for item in modules)},
         ]
         return {"cards": cards, "modules": modules}
+
+    # ---------- 变更签发受理回执 ----------
+
+    def save_change_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        """保存签发受理回执；回执以受理编号（默认为变更单登记编号）为键。"""
+        self._change_receipts[str(receipt["receipt_no"])] = receipt
+        return receipt
+
+    def find_change_receipt(self, receipt_no: str) -> dict[str, Any] | None:
+        return self._change_receipts.get(str(receipt_no))
+
+    def change_receipt_aliases(self, receipt: dict[str, Any]) -> list[str]:
+        """返回指向同一份回执的全部受理编号（含别名）。"""
+        return sorted(
+            no for no, stored in self._change_receipts.items() if stored is receipt
+        )
+
+    def change_receipt_for_change(
+        self, change_id: int, fingerprint: str | None = None,
+    ) -> dict[str, Any] | None:
+        """按变更单反查受理回执；同一变更只保留一份有效受理。"""
+        seen: set[int] = set()
+        for receipt in self._change_receipts.values():
+            if id(receipt) in seen:
+                continue
+            seen.add(id(receipt))
+            if int(receipt.get("change_id", 0)) != int(change_id):
+                continue
+            if fingerprint is not None and receipt.get("fingerprint") != fingerprint:
+                continue
+            return receipt
+        return None
+
+    def alias_change_receipt(
+        self, receipt_no: str, receipt: dict[str, Any],
+    ) -> None:
+        """把同一变更的另一个受理编号别名到已有回执，保证原号可查。"""
+        if receipt_no:
+            self._change_receipts[str(receipt_no)] = receipt
 
     # ---------- 跨模块索引查询 ----------
 

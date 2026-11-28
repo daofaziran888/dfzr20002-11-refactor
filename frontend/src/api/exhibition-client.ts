@@ -31,8 +31,44 @@ export async function confirmHandover(handoverId: number): Promise<HandoverResul
   return await response.json()
 }
 
-export async function issueChangeOrder(changeId: number): Promise<{ ok: boolean; reason: string }> {
-  const response = await request(`${EXHIBITION_BASE}/change/${changeId}/issue`, { method: 'POST' })
+export interface ChangeIssueResult {
+  ok: boolean
+  reason: string
+  receipt_no?: string
+  receipt_kind?: string
+  affected_nodes?: { id: number; name: string }[]
+  affected_checklists?: { id: number; item: string }[]
+  first_issuance?: ChangeFirstIssuance | null
+}
+
+export interface ChangeFirstIssuance {
+  receipt_no: string
+  change_id: number
+  complete: boolean
+  affected_booths: string[]
+  affected_nodes: { id: number; name: string }[]
+  affected_checklists: { id: number; item: string }[]
+  reverted_nodes: number
+  reverted_checklists: number
+}
+
+export async function issueChangeOrder(
+  changeId: number,
+  receiptNo?: string,
+): Promise<ChangeIssueResult> {
+  const query = receiptNo ? `?receipt_no=${encodeURIComponent(receiptNo)}` : ''
+  const response = await request(`${EXHIBITION_BASE}/change/${changeId}/issue${query}`, {
+    method: 'POST',
+  })
+  return await response.json()
+}
+
+export async function fetchChangeReceipt(
+  changeId: number,
+  receiptNo?: string,
+): Promise<{ ok: boolean; receipt_no?: string; first_issuance?: ChangeFirstIssuance; reason?: string }> {
+  const query = receiptNo ? `?receipt_no=${encodeURIComponent(receiptNo)}` : ''
+  const response = await request(`${EXHIBITION_BASE}/change/${changeId}/receipt${query}`)
   return await response.json()
 }
 
